@@ -14,9 +14,6 @@
 #include <ntifs.h>
 #include <stdarg.h>
 
-EXTERN_C DRIVER_INITIALIZE DriverEntry;
-static DRIVER_UNLOAD SvDriverUnload;
-static CALLBACK_FUNCTION SvPowerCallbackRoutine;
 
 EXTERN_C
 VOID
@@ -268,6 +265,213 @@ typedef struct _GUEST_CONTEXT
 //
 #define CPUID_UNLOAD_SIMPLE_SVM     0x41414141
 #define CPUID_HV_MAX                CPUID_HV_INTERFACE
+
+// Protection Tables
+#define MAX_PROTECTED_TABLES 3      
+#define MAX_CALLBACKS_PER_TABLE 16
+
+typedef struct CALLBACK_PROTECTION_CONTEXT{
+
+struct {
+    UINT64 ArrayVa; 
+    UINT64 SavedValues[MAX_CALLBACKS_PER_TABLE];
+    ULONG Count; 
+    const char* Name; 
+} ProtectedTables[MAX_PROTECTED_TABLES];
+
+ULONG ProtectedTableCount; 
+KTIMER IntegrityTimer; 
+KDPC IntegrityDpc;
+
+volatile BOOLEAN IntegrityEnabled; 
+} CALLBACK_PROTECTION, * PCALLBACK_PROTECTION_CONTEXT;
+
+static CALLBACK_PROTECTION_CONTEXT g_ProtectionContext{ 0 };
+
+
+
+// Forward declarations.
+
+_Use_decl_annotations_
+static
+VOID
+SvDriverUnload (
+    PDRIVER_OBJECT DriverObject
+    );
+
+_Use_decl_annotations_
+static
+VOID
+SvPowerCallbackRoutine (
+    PVOID CallbackContext,
+    PVOID Argument1,
+    PVOID Argument2
+    );
+
+
+_Function_class_(KDEFERRED_ROUTINE)
+_IRQL_requires_(DISPATCH_LEVEL)
+static VOID SvIntegrityCheckDpc(_In_ PKDPC Dpc, _In_opt_ PVOID DeferredContext, _In_opt_ PVOID SystemArgument1, _In_opt_ PVOID SystemArgument2)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(DeferredContext);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+    
+    if (!g_ProtectionContext.IntegrityEnabled) {
+        return;
+    }
+
+    ULONG totalRestored = 0;
+
+    for (ULONG t=0; t < g_ProtectionContext.ProtectedTableCount; t++){
+        PVOID array = (PVOID)g_ProtectionContext.ProtectedTables[t].ArrayVa;
+        if (array == NULL || !MmIsAddressValid(array)){
+            continue;
+        }
+
+        for (ULONG i = 0; i < g_ProtectionContext.ProtectedTables[t].Count; i++){
+            UINT64* entry = (UINT64*)((PUCHAR)array + (i * 8));
+            if (!MmIsAddressValid(entry)){
+                continue;
+            }
+
+            UINT64 current = *entry;
+            UINT64 saved = g_ProtectionContext.ProtectedTables[t].SavedValues[i];
+
+            UINT64 currentAddr = current & ~0xFULL;
+            UINT64 savedAddr = saved & ~0xFULL;
+
+            if (saved != 0 && (current == 0 || currentAddr != savedAddr)){
+                *entry = saved;
+                totalRestored++;
+            }
+
+        }
+    }
+
+    if (totalRestored > 0){
+        DbgPrint("Blocked Attack Restored %lu callbacks\n", totalRestored);
+    }
+
+    LARGE_INTEGER dueTime;
+    dueTime.QuadPart = -10 * 10000LL;
+    KeSetTimer(&g_ProtectionContext.IntegrityTimer, dueTime, &g_ProtectionContext.IntegrityDpc);
+}
+
+
+static VOID SvAddProtectedTable(_In_ PVOID ArrayVa, _In_ const char* Name){
+    if (g_ProtectionContext.ProtectedTableCount >= MAX_PROTECTED_TABLES){
+        return;
+    }
+
+    ULONG idx = g_ProtectionContext.ProtectedTableCount;
+    g_ProtectionContext.ProtectedTables[idx].ArrayVa = (UINT64)ArrayVa;
+    g_ProtectionContext.ProtectedTables[idx].Name = Name;
+    g_ProtectionContext.ProtectedTables[idx].Count = MAX_CALLBACKS_PER_TABLE;
+
+    ULONG nonZero = 0;
+    for (ULONG i = 0; i < MAX_CALLBACKS_PER_TABLE; i++){
+        UINT64* entry = (UINT64*)((PUCHAR)ArrayVa + (i * 8));
+        if (MmIsAddressValid(entry)){
+            UINT64 val = *entry;
+            g_ProtectionContext.ProtectedTables[idx].SavedValues[i] = val;
+            if (val != 0) nonZero++;
+        }
+        else{
+            g_ProtectionContext.ProtectedTables[idx].SavedValues[i] = 0;
+        }
+    }
+
+    g_ProtectionContext.ProtectedTableCount++;
+    DbgPrint("Protected %s callbacks (%lu nonZero)\n", Name, nonZero);
+
+}
+
+static PVOID SvFindCallbackArray(_In_ const wchar_t* FunctionName){
+    UNICODE_STRING routineName;
+    RtlInitUnicodeString(&routineName, FunctionName);
+
+    PUCHAR funcAddress = (PUCHAR)MmGetSystemRoutineAddress(&routineName);
+    if (funcAddress == NULL){
+        return NULL;
+    }
+
+    
+    PUCHAR scanStart = funcAddress;
+    for (int i = 0; i < 20; i++){
+        if (funcAddress[i] == 0xE9 || funcAddress[i] == 0xE8){
+            scanStart = funcAddress + i + 5 + *(PLONG)(funcAddress + i + 1);
+            break;
+        }
+    }
+
+    for (int i = 0; i < 0x200; i++){
+        if ((scanStart[i] == 0x48 || scanStart[i] == 0x4C) && scanStart[i+1] == 0x8D){
+            if ((scanStart[i+2] & 0xC7) == 0x05)
+            { 
+                LONG offset = *(PLONG)(scanStart + i + 3);
+                PVOID arrayAddr = (PVOID)(scanStart + i + 7 + offset);
+
+                if (MmIsAddressValid(arrayAddr)){
+                    return arrayAddr;
+                }
+            }
+        }
+    }
+
+    return NULL;
+}
+
+
+
+NTSTATUS SvInitialiseCallbackProtection(VOID){
+    DbgPrint("Initialising callback Protection\n");
+
+    RtlZeroMemory(&g_ProtectionContext, sizeof(g_ProtectionContext));
+
+    PVOID processArray = SvFindCallbackArray(L"PsSetCreateProcessNotifyRoutine");
+    if (processArray){
+        SvAddProtectedTable(processArray, "Process");
+    }
+
+    PVOID threadArray = SvFindCallbackArray(L"PsSetCreateThreadNotifyRoutine");
+    if (threadArray){
+        SvAddProtectedTable(threadArray, "Thread");
+    }
+
+    PVOID ImageArray = SvFindCallbackArray(L"PsSetLoadImageNotifyRoutine");
+    if (ImageArray){
+        SvAddProtectedTable(ImageArray, "Image");
+    }
+
+    DbgPrint("Total protected: %lu tables\n", g_ProtectionContext.ProtectedTableCount);
+
+    KeInitializeTimer(&g_ProtectionContext.IntegrityTimer);
+    KeInitializeDpc(&g_ProtectionContext.IntegrityDpc, SvIntegrityCheckDpc, NULL);
+
+    LARGE_INTEGER dueTime;
+    dueTime.QuadPart = -10 * 10000LL;
+    KeSetTimer(&g_ProtectionContext.IntegrityTimer, dueTime, &g_ProtectionContext.IntegrityDpc);
+
+    g_ProtectionContext.IntegrityEnabled = TRUE;
+    DbgPrint("Timer started checking every 10ms\n");
+
+    return STATUS_SUCCESS;
+
+
+}
+
+
+VOID SvCleanupCallbackProtection(VOID){
+    if (g_ProtectionContext.IntegrityEnabled){
+        g_ProtectionContext.IntegrityEnabled = FALSE;
+        KeCancelTimer(&g_ProtectionContext.IntegrityTimer);
+        DbgPrint("Timer cancelled\n");
+    }
+}
+
+
 
 /*!
     @brief      Breaks into a kernel debugger when it is present.
@@ -1898,9 +2102,12 @@ DriverEntry (
     //
     status = SvVirtualizeAllProcessors();
 
+
 Exit:
     if (NT_SUCCESS(status))
     {
+
+        SvInitialiseCallbackProtection();
         //
         // On success, save the registration handle for un-registration.
         //
@@ -1936,6 +2143,8 @@ SvDriverUnload (
 {
     UNREFERENCED_PARAMETER(DriverObject);
 
+    SvCleanupCallbackProtection();
+
     SV_DEBUG_BREAK();
 
     //
@@ -1948,6 +2157,8 @@ SvDriverUnload (
     // De-virtualize all processors on the system.
     //
     SvDevirtualizeAllProcessors();
+
+    
 }
 
 /*!
