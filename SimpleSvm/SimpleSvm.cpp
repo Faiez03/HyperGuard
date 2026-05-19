@@ -337,10 +337,14 @@ static VOID SvIntegrityCheckDpc(_In_ PKDPC Dpc, _In_opt_ PVOID DeferredContext, 
             }
 
             UINT64 current = *entry;
-            UINT64 saved = g_ProtectionContext.ProtectedTables[t].SavedValues[i];
-
+            UINT64 saved = g_ProtectionContext.ProtectedTables[t].SavedValues[i];#
+            
+            // Mask off the lower 4 flag bits to compare actual pointer addresses
             UINT64 currentAddr = current & ~0xFULL;
             UINT64 savedAddr = saved & ~0xFULL;
+
+            // Restore if the entry was nulled or replaced with a different pointer
+            // This catches both the MDL safe-write null technique and direct overwrites
 
             if (saved != 0 && (current == 0 || currentAddr != savedAddr)){
                 *entry = saved;
@@ -354,6 +358,7 @@ static VOID SvIntegrityCheckDpc(_In_ PKDPC Dpc, _In_opt_ PVOID DeferredContext, 
         DbgPrint("Blocked Attack Restored %lu callbacks\n", totalRestored);
     }
 
+    // Re-arm the timer so the check runs again in 10ms 
     LARGE_INTEGER dueTime;
     dueTime.QuadPart = -10 * 10000LL;
     KeSetTimer(&g_ProtectionContext.IntegrityTimer, dueTime, &g_ProtectionContext.IntegrityDpc);
@@ -369,6 +374,10 @@ static VOID SvAddProtectedTable(_In_ PVOID ArrayVa, _In_ const char* Name){
     g_ProtectionContext.ProtectedTables[idx].ArrayVa = (UINT64)ArrayVa;
     g_ProtectionContext.ProtectedTables[idx].Name = Name;
     g_ProtectionContext.ProtectedTables[idx].Count = MAX_CALLBACKS_PER_TABLE;
+
+    // Snapshot all current callback entries in the array
+    // EX_CALLBACK pointers are stored encoded — lower 4 bits are lock/flags, not part of the address
+    // We save the raw encoded value so we can detect any modification, including partial clears
 
     ULONG nonZero = 0;
     for (ULONG i = 0; i < MAX_CALLBACKS_PER_TABLE; i++){
@@ -392,6 +401,8 @@ static PVOID SvFindCallbackArray(_In_ const wchar_t* FunctionName){
     UNICODE_STRING routineName;
     RtlInitUnicodeString(&routineName, FunctionName);
 
+
+    // Resolve the exported function address (PsSetCreateProcessNotifyRoutine)
     PUCHAR funcAddress = (PUCHAR)MmGetSystemRoutineAddress(&routineName);
     if (funcAddress == NULL){
         return NULL;
@@ -405,6 +416,11 @@ static PVOID SvFindCallbackArray(_In_ const wchar_t* FunctionName){
             break;
         }
     }
+
+    // Scan for a RIP-relative LEA instruction (48/4C 8D [05|0D|15|2D])
+    // These are used by the kernel to reference the internal Psp*NotifyRoutine arrays
+    // Decode the RIP-relative offset to get the actual array VA
+    // This avoids hardcoded offsets that break across Windows builds
 
     for (int i = 0; i < 0x200; i++){
         if ((scanStart[i] == 0x48 || scanStart[i] == 0x4C) && scanStart[i+1] == 0x8D){
@@ -430,6 +446,8 @@ NTSTATUS SvInitialiseCallbackProtection(VOID){
 
     RtlZeroMemory(&g_ProtectionContext, sizeof(g_ProtectionContext));
 
+    // Locate and snapshot all three kernel callback arrays
+    // If any array can't be found the others are still protected
     PVOID processArray = SvFindCallbackArray(L"PsSetCreateProcessNotifyRoutine");
     if (processArray){
         SvAddProtectedTable(processArray, "Process");
@@ -447,6 +465,9 @@ NTSTATUS SvInitialiseCallbackProtection(VOID){
 
     DbgPrint("Total protected: %lu tables\n", g_ProtectionContext.ProtectedTableCount);
 
+
+    // Set up a KTIMER + KDPC pair the DPC runs at DISPATCH_LEVEL every 10ms
+    // and restores any callbacks that were modified since the snapshot
     KeInitializeTimer(&g_ProtectionContext.IntegrityTimer);
     KeInitializeDpc(&g_ProtectionContext.IntegrityDpc, SvIntegrityCheckDpc, NULL);
 
